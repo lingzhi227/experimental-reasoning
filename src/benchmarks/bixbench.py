@@ -181,6 +181,13 @@ class BixBenchERRunner:
         """Core task execution logic."""
         work_dir = Path(work_dir)
 
+        # Record original files (for cleanup of generated artifacts after task)
+        original_files = set()
+        if work_dir.exists():
+            original_files = {
+                f.name for f in work_dir.iterdir()
+            }
+
         # List data files in work directory
         data_files = []
         if work_dir.exists():
@@ -309,9 +316,31 @@ class BixBenchERRunner:
 
                 if action == "answer":
                     # Final answer — clean markdown/explanation pollution
-                    answer = self._clean_answer(str(content.get("answer", "")))
+                    raw_ans = str(content.get("answer", ""))
+                    answer = self._clean_answer(raw_ans, task.eval_mode or "str_verifier")
                     reasoning = content.get("reasoning", "")
                     evidence = content.get("evidence_summary", "")
+
+                    # Answer validation: if cleaned answer is still long text,
+                    # ask for a concise re-answer (costs 1 extra API call)
+                    if len(answer) > 50 and task.eval_mode != "llm_verifier":
+                        logger.warning(
+                            "Step %d — answer too long (%d chars), requesting concise value",
+                            step, len(answer),
+                        )
+                        refine_content = await asyncio.to_thread(
+                            session.send_json,
+                            "Your answer is too verbose. Respond with ONLY the precise value "
+                            "(a number, percentage, gene name, or short phrase). "
+                            "No explanations, no units unless asked.\n"
+                            '{"reasoning": "...", "action": "answer", "answer": "VALUE_ONLY"}'
+                        )
+                        if "raw_response" not in refine_content:
+                            refined = str(refine_content.get("answer", ""))
+                            if refined:
+                                answer = self._clean_answer(refined, task.eval_mode or "str_verifier")
+                                logger.info("Step %d — refined answer: %s", step, answer[:100])
+
                     logger.info(
                         "Step %d — ANSWER: %s (reasoning: %s)",
                         step, answer[:100], reasoning[:100],
@@ -435,10 +464,10 @@ class BixBenchERRunner:
                     'Respond with ONLY this JSON: {"reasoning":"...","action":"answer","answer":"YOUR_VALUE"}\n'
                     "The answer field must contain ONLY the precise value — no explanations.",
                 )
-                answer = self._clean_answer(str(content.get("answer", content.get("final_answer", ""))))
+                answer = self._clean_answer(str(content.get("answer", content.get("final_answer", ""))), task.eval_mode or "str_verifier")
                 # If still no answer from JSON, try raw extraction
                 if not answer and "raw_response" in content:
-                    answer = self._clean_answer(self._extract_answer_from_raw(content["raw_response"]))
+                    answer = self._clean_answer(self._extract_answer_from_raw(content["raw_response"]), task.eval_mode or "str_verifier")
 
             cmm_stats = cmm.stats()
             cmm.close()
@@ -457,6 +486,19 @@ class BixBenchERRunner:
             # Clean up Docker environment if used
             if hasattr(environment, "cleanup"):
                 environment.cleanup()
+            # Remove generated artifacts (R scripts, CSV outputs, etc.)
+            # so they don't pollute the next task sharing this capsule
+            if work_dir.exists():
+                for f in work_dir.iterdir():
+                    if f.name not in original_files:
+                        try:
+                            if f.is_file():
+                                f.unlink()
+                            elif f.is_dir():
+                                import shutil
+                                shutil.rmtree(f)
+                        except OSError:
+                            pass
 
     @staticmethod
     def _force_extract_from_raw(raw: str) -> dict[str, Any] | None:
@@ -511,127 +553,231 @@ class BixBenchERRunner:
         return ""
 
     @staticmethod
-    def _clean_answer(raw_answer: str) -> str:
+    def _clean_answer(raw_answer: str, eval_mode: str = "str_verifier") -> str:
         """Clean model's answer to extract just the precise value.
 
-        Handles common pollution patterns:
-        - Markdown bold: **value** -> value
-        - Trailing explanations after newlines: "42\\nBecause..." -> "42"
-        - Percentage with explanation: "10.6%\\n\\nAnalysis..." -> "10.6%"
-        - Leading/trailing whitespace and quotes
+        For llm_verifier: return full text (judge LLM needs context).
+        For str_verifier/range_verifier: extract precise value from full text.
+        Priority: bold > "answer is X" > approx > percentage > comma-number > first line.
         """
         import re
         if not raw_answer:
             return ""
-        # Take only the first line (before any newlines with explanations)
-        first_line = raw_answer.split("\n")[0].strip()
-        # Strip markdown bold markers
+
+        full_text = raw_answer.strip()
+
+        # For llm_verifier, return full text (judge LLM compares semantically)
+        if eval_mode == "llm_verifier":
+            return re.sub(r"\*\*(.+?)\*\*", r"\1", full_text)
+
+        # 1. Strip markdown bold — if there's a **value**, that's the intended answer
+        bold_match = re.search(r"\*\*(.+?)\*\*", full_text)
+        if bold_match:
+            val = bold_match.group(1).strip()
+            if re.match(r'^-?\d[\d,.]*%?$', val) or len(val) <= 30:
+                return val
+
+        # 2. First line processing
+        first_line = full_text.split("\n")[0].strip()
         first_line = re.sub(r"\*\*(.+?)\*\*", r"\1", first_line)
-        # Strip markdown italic
         first_line = re.sub(r"\*(.+?)\*", r"\1", first_line)
-        # Strip backticks
-        first_line = first_line.strip("`")
-        # Strip surrounding quotes
-        first_line = first_line.strip("\"'")
-        # Strip trailing period if it looks like a sentence ender after a value
+        first_line = first_line.strip("`\"'")
         if first_line.endswith(".") and not re.match(r"^\d+\.\d*$", first_line):
             first_line = first_line[:-1].strip()
-        return first_line.strip()
+
+        # 3. If first line is a bare value, return immediately
+        if re.match(r'^-?\d[\d,.]*(?:[eE][+-]?\d+)?%?$', first_line):
+            return first_line
+        if len(first_line) <= 20 and ' ' not in first_line:
+            return first_line
+
+        # 4. PRIORITY: Search for "answer is X" first (highest confidence keyword)
+        answer_keyed = re.search(
+            r"\banswer\s*(?:is|=|:)\s*[\"'`]?(-?\d[\d,.]*(?:[eE][+-]?\d+)?%?)",
+            full_text, re.IGNORECASE,
+        )
+        if answer_keyed:
+            return answer_keyed.group(1).strip()
+
+        # 5. Search for "result/total is/=/: X" (lower priority than "answer")
+        other_keyed = re.search(
+            r"(?:result|total|count)\s*(?:is|=|:)\s*[\"'`]?"
+            r"(-?\d[\d,.]*(?:[eE][+-]?\d+)?%?)",
+            full_text, re.IGNORECASE,
+        )
+        if other_keyed:
+            return other_keyed.group(1).strip()
+
+        # 6. Search for "approximately X" or "≈ X" patterns
+        approx = re.search(
+            r"(?:approximately|approx\.?|≈|~)\s*(-?\d[\d,.]*(?:[eE][+-]?\d+)?%?)",
+            full_text, re.IGNORECASE,
+        )
+        if approx:
+            return approx.group(1).strip()
+
+        # 7. Search for a single percentage in full text
+        pcts = re.findall(r"(\d+\.?\d*%)", full_text)
+        if len(pcts) == 1:
+            return pcts[0]
+        # If multiple percentages, take the last one (usually the final answer)
+        if pcts:
+            return pcts[-1]
+
+        # 8. Search for comma-separated numbers like "4,550" or "1,234"
+        comma_nums = re.findall(r"\b(\d{1,3}(?:,\d{3})+)\b", full_text)
+        if len(comma_nums) == 1:
+            return comma_nums[0]
+
+        return first_line
 
     def _build_system_prompt(
         self, task: BixBenchTask, data_files: list[str], docker: bool = False
     ) -> str:
-        """Build enhanced system prompt with domain knowledge, tactics, and hypothesis management."""
-        # Get domain knowledge and tactics
+        """Build system prompt. Docker mode is concise; host mode includes domain knowledge."""
         if docker:
-            domain_knowledge = get_docker_bioinformatics_knowledge()
+            return self._build_docker_prompt(task)
         else:
-            domain_knowledge = get_bioinformatics_knowledge()
-        tactics_section = bioinformatics_tactics().to_prompt_section()
+            return self._build_host_prompt(task, data_files)
 
-        # Docker-specific vs host-only rules
-        if docker:
-            env_section = """\
-## Execution Environment (Docker — full bioinformatics toolkit)
-You are running inside a Docker container with a complete bioinformatics stack.
+    # ── Tactic-based tool selector ──────────────────────────────────────
+    # Maps question keywords → mandatory tool directives injected into prompt.
+    # This prevents the agent from choosing sub-optimal tools.
 
-### Tool Priority — IMPORTANT
-- **For DESeq2 / differential expression: ALWAYS use R DESeq2 via rpy2** — do NOT use PyDESeq2.
-  PyDESeq2 is a Python reimplementation with subtle numerical differences; the ground truth
-  for this benchmark was generated with R's DESeq2. Using PyDESeq2 will give wrong answers.
-- **For GO / pathway enrichment: use R clusterProfiler via rpy2**, or gseapy for GSEA.
-- **For phylogenetics: use MAFFT, IQ-TREE, ClipKIT, PhyKIT** (CLI tools via subprocess).
-- **For sequence analysis: use BLAST+, samtools, bcftools, bedtools** via subprocess.
-- For general data analysis: pandas, numpy, scipy, sklearn, statsmodels, lifelines are all available.
+    _TACTIC_RULES = [
+        {
+            "keywords": ["deseq2", "differential expression", "differentially expressed",
+                         "de analysis", "de genes", "log2foldchange", "logfold",
+                         "dispersion"],
+            "tactic": "deseq2",
+            "directive": (
+                "## MANDATORY: R DESeq2 via subprocess\n"
+                "This task requires DESeq2. You MUST use R DESeq2 via subprocess.\n"
+                "PyDESeq2 is DISABLED and will error if imported.\n\n"
+                "Pattern:\n"
+                "```python\n"
+                'r_script = """\n'
+                "library(DESeq2)\n"
+                'counts <- read.csv("/workspace/FILE.csv", row.names=1, check.names=FALSE)\n'
+                'coldata <- data.frame(condition=c(...))\n'
+                "dds <- DESeqDataSetFromMatrix(countData=counts, colData=coldata, design=~condition)\n"
+                "dds <- DESeq(dds)\n"
+                '# Dispersion BEFORE shrinkage: mcols(dds)$dispGeneEst\n'
+                '# Dispersion AFTER shrinkage: dispersions(dds)\n'
+                "res <- results(dds, contrast=c('condition','A','B'))\n"
+                'write.csv(as.data.frame(res), "/workspace/deseq2_results.csv")\n'
+                '"""\n'
+                'with open("/workspace/analysis.R", "w") as f:\n'
+                "    f.write(r_script)\n"
+                "import subprocess\n"
+                'result = subprocess.run(["Rscript", "/workspace/analysis.R"], capture_output=True, text=True, timeout=300)\n'
+                "print(result.stdout)\n"
+                'if result.returncode != 0: print("STDERR:", result.stderr)\n'
+                "```\n"
+            ),
+        },
+        {
+            "keywords": ["phylogenetic", "phylogeny", "tree", "alignment", "mafft",
+                         "iqtree", "newick"],
+            "tactic": "phylogenetics",
+            "directive": (
+                "## MANDATORY: CLI bioinformatics tools\n"
+                "Use mafft (alignment), clipkit (trimming), iqtree2 (tree building), "
+                "phykit (tree analysis) via subprocess.\n"
+            ),
+        },
+        {
+            "keywords": ["enrichment", "go analysis", "pathway", "gsea", "gene ontology",
+                         "kegg"],
+            "tactic": "enrichment",
+            "directive": (
+                "## MANDATORY: Enrichment tools\n"
+                "Use R clusterProfiler via subprocess (preferred) or Python gseapy.\n"
+            ),
+        },
+        {
+            "keywords": ["variant", "vaf", "mutation", "vcf", "allele frequency",
+                         "snp", "indel"],
+            "tactic": "variant_analysis",
+            "directive": (
+                "## MANDATORY: Variant analysis\n"
+                "Use pandas for Excel/CSV variant data. For VCF files, use bcftools via subprocess.\n"
+                "Watch for multi-level Excel headers (skiprows may be needed).\n"
+            ),
+        },
+    ]
 
-### Available Libraries (Python)
-pandas, numpy, scipy, sklearn, matplotlib, statsmodels, openpyxl, lifelines,
-biopython, rpy2, gseapy, phykit, pysam
+    def _detect_tactics(self, question: str) -> list[dict]:
+        """Detect which tactics apply based on question keywords."""
+        q_lower = question.lower()
+        matched = []
+        for rule in self._TACTIC_RULES:
+            if any(kw in q_lower for kw in rule["keywords"]):
+                matched.append(rule)
+        return matched
 
-### Available CLI Tools (via subprocess)
-mafft, iqtree2, clipkit, phykit, blastn, blastp, makeblastdb,
-samtools, bcftools, bedtools, fastqc, trimmomatic
+    def _build_docker_prompt(self, task: BixBenchTask) -> str:
+        """Concise Docker system prompt with tactic-driven tool selection."""
+        # Detect applicable tactics from the question
+        tactics = self._detect_tactics(task.question)
+        tactic_names = [t["tactic"] for t in tactics]
+        tactic_directives = "\n".join(t["directive"] for t in tactics)
 
-### R Packages (via rpy2)
-DESeq2, edgeR, clusterProfiler, enrichplot, org.Hs.eg.db, splines, ggplot2
-
-### Installing Additional Packages
-- Python: subprocess.run([sys.executable, '-m', 'pip', 'install', 'package_name', '-q'])
-- R: ro.r('install.packages("pkg", repos="https://cloud.r-project.org")')"""
-        else:
-            env_section = """\
-## Execution Environment (Host Python)
-- Common libraries available: pandas, numpy, scipy, sklearn, matplotlib, statsmodels, openpyxl, lifelines, pydeseq2
-- To install additional packages, use: subprocess.run([sys.executable, '-m', 'pip', 'install', 'package_name', '-q'])
-- NEVER try to install R or conda packages — use Python alternatives instead"""
+        logger.info(
+            "Task %s — detected tactics: %s",
+            task.question_id, tactic_names or ["general"],
+        )
 
         return f"""\
-You are an expert Experimental Reasoning agent for bioinformatics data analysis.
-You have deep knowledge of statistical methods, genomics, and biological data analysis.
+You are an expert bioinformatics data analyst. You iteratively write and execute Python code to answer a research question. The working directory contains the data files.
 
-## Your Task
-You will analyze biological data files to answer a research question.
-You work by iteratively writing and executing Python code, observing results,
-and refining your analysis until you can provide a precise answer.
+## Response Format
+Respond with a single raw JSON object (no markdown, no wrapping):
 
-## Reasoning Process
-For each step:
-1. ORIENT: What do I know so far? What do I need to find out?
-2. HYPOTHESIZE: What's my best guess and how can I test it?
-3. EXPERIMENT: Write targeted code to test the hypothesis
-4. OBSERVE: Examine results carefully
-5. EVALUATE: Does this answer the question? If not, what's next?
+Code: {{"reasoning": "...", "action": "code", "code": "..."}}
+Answer: {{"reasoning": "...", "action": "answer", "answer": "PRECISE_VALUE_ONLY"}}
 
-## Output Format
-You MUST respond with a single valid JSON object. No markdown, no code blocks, no extra text.
-Do NOT wrap your response in ```json``` or any other formatting.
+{tactic_directives if tactic_directives else "## Available Tools"}
+{"" if tactic_directives else "pandas, numpy, scipy, statsmodels, lifelines, sklearn, biopython, R (via subprocess), CLI tools (mafft, iqtree2, blast, samtools, bcftools, bedtools, phykit)."}
 
-For code execution:
-{{"reasoning": "what I'm doing and why", "current_hypothesis": "my hypothesis about the answer", "hypothesis_status": "testing", "action": "code", "code": "python code here"}}
+## General Rules
+- Explore data first: df.head(), df.shape, df.columns, df.dtypes
+- Write focused code testing ONE thing at a time
+- Use print() to see intermediate results
+- Answer must be ONLY the precise value — no explanations, no units
+- R column names: use `check.names=FALSE` in read.csv to preserve original names
 
-For final answer:
-{{"reasoning": "summary of evidence chain", "current_hypothesis": "confirmed hypothesis", "hypothesis_status": "supported", "evidence_summary": "key findings that support the answer", "action": "answer", "answer": "precise answer value"}}
+## Eval mode: '{task.eval_mode or "str_verifier"}'
+{"Provide an exact string/number match." if task.eval_mode == "str_verifier" else ""}\
+{"Provide a number within the specified range." if task.eval_mode == "range_verifier" else ""}
+"""
 
-CRITICAL: Every response must be a raw JSON object. Not markdown. Not text with JSON inside. Just the JSON object starting with {{ and ending with }}.
+    def _build_host_prompt(
+        self, task: BixBenchTask, data_files: list[str]
+    ) -> str:
+        """Host-mode prompt with full domain knowledge (no Docker tools available)."""
+        domain_knowledge = get_bioinformatics_knowledge()
+        tactics_section = bioinformatics_tactics().to_prompt_section()
 
-## Important Rules
-- Start by exploring data files to understand structure (head, shape, columns, dtypes)
-- Write focused code that tests ONE thing at a time
-- The working directory contains the data files — use relative paths
-- When your code sets a variable called `_answer`, I will extract it
-- Use print() statements to see intermediate results
+        return f"""\
+You are an expert bioinformatics data analyst. You iteratively write and execute Python code to answer a research question. The working directory contains the data files.
 
-{env_section}
+## Response Format
+Respond with a single raw JSON object (no markdown, no wrapping):
 
-## Answer Format
-- When action='answer', the 'answer' field must contain ONLY the precise value
-- For numbers: just the number, e.g. "0.0002" or "42.5"
-- For strings: just the value, e.g. "BRCA1" or "1-50"
-- NO explanations, NO units, NO formatting — just the raw value
-- If the answer is a range like (1.50,1.54), provide a number within that range
+Code: {{"reasoning": "...", "action": "code", "code": "..."}}
+Answer: {{"reasoning": "...", "action": "answer", "answer": "PRECISE_VALUE_ONLY"}}
 
-## Eval mode
-This question uses eval_mode='{task.eval_mode or "str_verifier"}'. \
+## Rules
+- Explore data first: df.head(), df.shape, df.columns, df.dtypes
+- Write focused code testing ONE thing at a time
+- Available: pandas, numpy, scipy, sklearn, matplotlib, statsmodels, openpyxl, lifelines, pydeseq2
+- pip install: subprocess.run([sys.executable, '-m', 'pip', 'install', 'pkg', '-q'])
+- NEVER install R or conda — use Python alternatives
+- Use print() to see intermediate results
+- Answer must be ONLY the precise value — no explanations, no units
+
+## Eval mode: '{task.eval_mode or "str_verifier"}'
 {"Provide an exact string/number match." if task.eval_mode == "str_verifier" else ""}\
 {"Provide a number within the specified range." if task.eval_mode == "range_verifier" else ""}
 

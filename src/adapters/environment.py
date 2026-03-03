@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +52,24 @@ warnings.filterwarnings("ignore")
 
 MAX_OUTPUT = 50_000  # 50 KB stdout cap
 
+# Blocked imports — force agent to use correct tools
+_BLOCKED_IMPORTS = {
+    "pydeseq2": "PyDESeq2 is DISABLED. Use R DESeq2 via subprocess: write .R file, run with Rscript.",
+}
+
+def _check_blocked_imports(code: str) -> str | None:
+    """Return error message if code tries to import a blocked package."""
+    import re
+    for pkg, msg in _BLOCKED_IMPORTS.items():
+        if re.search(rf'\bimport\s+{pkg}\b|from\s+{pkg}\b', code):
+            return msg
+    return None
+
 def run_one(code: str) -> dict:
+    blocked = _check_blocked_imports(code)
+    if blocked:
+        return {"output": "", "error": blocked}
+
     old_out, old_err = sys.stdout, sys.stderr
     cap_out, cap_err = io.StringIO(), io.StringIO()
     try:
@@ -174,7 +192,7 @@ class DockerPythonEnvironment:
         self.work_dir = Path(work_dir)
         self.timeout_seconds = timeout_seconds
         self._process: subprocess.Popen | None = None
-        self._container_name = f"er_repl_{os.getpid()}"
+        self._container_name = f"er_repl_{uuid.uuid4().hex[:8]}"
 
         # Write the server script to work_dir
         self.work_dir.mkdir(parents=True, exist_ok=True)
